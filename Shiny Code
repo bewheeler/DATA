@@ -1,0 +1,741 @@
+#
+
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(shiny)
+library(RODBC)
+library(tidyverse)
+library(rgdal)
+library(units)
+library(sp)
+library(sf)
+library(raster)
+library(DBI)
+library(rgeos)
+library(rgdal)
+library(plotly)
+library(openxlsx)
+library(writexl)
+library(gridExtra)
+library(utils)
+
+# Define UI for application
+ui <- fluidPage(
+    
+    # Application title
+    titlePanel("DATA- Data Analysis Tool for AIM"),
+    
+    
+    # Sidebar with a slider input for number of bins
+    sidebarLayout(
+        sidebarPanel(
+            helpText("Note: This app does not test for normality and therefore displays
+                     a variety of summary statistics"),
+            fileInput(inputId = "file1",
+                      label = "Upload all files within unzipped shapefile",
+                      multiple = TRUE),
+            helpText("Drop down menus will appear once your shapefile is uploaded"),
+            uiOutput("selectcolumn"),
+            uiOutput("selectstratum"),
+            helpText("Click start after selecting stratum-only click once!"),
+            actionButton("gobutton","Start"),
+            helpText("It will take a minute to load after clicking start"),
+            helpText("Input your expected benchmark below as a value ranging from 0-100. Ex. 10"),
+            textInput("baresoilbench","Percent Bare Soil"),
+            textInput("foliar","Percent Foliar Cover"),
+            textInput("perforb","Percent Perennial Forb Cover"),
+            textInput("sagecover","Percent Sage Cover"),
+            textInput("soilstab","Soil Stability"),
+            textInput("gapcover","Percent Gap Cover"),
+            textInput("noxcover","Percent Noxious Species"),
+            textInput("perengrass","Percent Perennial Grass Species"),
+            helpText("Wait to download data until the dominant species graph is displaying in the window"),
+            downloadButton('download',"Download the exel sheets of the data"),
+            downloadButton('allgraphs',"Download the graphs of the data"),
+            helpText("The benchmark excel below will download a spreadsheet of plots not meeting the input benchmark value and the assosciated lat/long (for easy conversion to shapefile)"),
+            downloadButton('benchxl',"Download the benchmark excel")
+            
+            
+            
+            
+            
+        ),
+        
+        mainPanel(
+            tabsetPanel(
+                tabPanel("Surface Cover",plotOutput("surfacecoverplt"),verbatimTextOutput("sumsurfacecover"),helpText("If any of the tables are not displaying, ensure you have input benchmark values"),
+                         helpText("Below are the plots with more bare soil than the expected benchmark"),verbatimTextOutput("pltswbs"),
+                         helpText("Below are the plots with less foliar cover than the expected benchmark"),verbatimTextOutput("pltswof"),
+                         helpText("Below are the plots with less nonnoxious perennial forb cover than the expected benchmark"),verbatimTextOutput("pltswpf"),
+                         helpText("Below are the plots with less sage cover than the expected benchmark"),verbatimTextOutput("pltswsc")),
+                tabPanel("Soil Stability",verbatimTextOutput("sumallsoil"),helpText("Below are the plots with soil stability less than the expected benchmark"),verbatimTextOutput("pltswoss")),
+                tabPanel("Gap",plotOutput("gapbarchart"),verbatimTextOutput("sumgap"),
+                         helpText("Below are the plots with percent gap covering more than the expected benchmark"),verbatimTextOutput("pltswgap")),
+                tabPanel("Heights",verbatimTextOutput("sumheights")),
+                tabPanel("Noxious",plotOutput("Noxgraph"),helpText("Below are the plots with noxious species greater the expected benchmark"),verbatimTextOutput("pltswnox")),
+                tabPanel("Ann/Per Grass",plotOutput("APGrassgraph"),helpText("Below are the plots with less than the expected benchmark for percent perennial grass species"),verbatimTextOutput("pltswann")),
+                tabPanel("Dominant Species",helpText("Data will take a minute to load"),plotOutput("domss"),verbatimTextOutput("sumdomss"))
+                
+            ))
+    ))
+
+
+# server
+server <- function(input, output) {
+    
+    projbounddata<-reactive({
+        if(is.null(input$file1)){return()}
+        shpdf <- input$file1
+        tempdirname <- dirname(as.character(shpdf$datapath[1]))
+        for (i in 1:nrow(shpdf)) {
+            file.rename(
+                shpdf$datapath[i],
+                paste0(tempdirname, "/", shpdf$name[i])
+            )
+        }
+        
+        projboundary <- readOGR(paste(tempdirname,
+                                      shpdf$name[grep(pattern = "*.shp$", shpdf$name)],
+                                      sep = "/"
+        ))
+        
+    })
+    
+    output$selectcolumn<-renderUI({
+        projboundary1 <- req(projbounddata())
+        selectInput("Select","Select Column Containing Stratum of Interest",choices=unique(names(projboundary1)) )
+    })
+    
+    output$selectstratum<-renderUI({
+        req(input$Select)
+        projboundary2 <- projbounddata()
+        projboundary3<-as.data.frame(projboundary2)
+        r <- projboundary3[,input$Select]
+        selectInput("name","Select Stratum of Interest",choices=unique(r))
+    })
+    
+    
+    AIMdata <- eventReactive(input$gobutton,{
+        if(is.null(input$name)){
+            return()
+        }
+        
+        
+        stboundary<-st_as_sf(projbounddata())%>% st_transform(26919) %>%st_set_crs(26919)
+        shape_sf <- st_transform(x=stboundary, crs="+proj=longlat +datum=NAD83 +no_defs")
+        AIMdatadb<-read.csv("./Data/AIMdataCO.csv")
+        coordinates(AIMdatadb)<-~Longitude + Latitude
+        AIMdatadf<-st_as_sf(AIMdatadb)
+        st_crs(AIMdatadf)<-"+proj=longlat +datum=NAD83 +no_defs"
+        newdf<-st_join(AIMdatadf,shape_sf)
+        Dataframe2 <- newdf[,c(input$Select,"PrimaryKey")] 
+        df3<-na.omit(Dataframe2)
+        plots<-df3$PrimaryKey
+        AIMdata<-newdf %>% filter(PrimaryKey %in% plots)
+        AIMdata2<-as.data.frame(AIMdata)
+        AIMdata2<-AIMdata2 %>% 
+            mutate_if(is.numeric, round, digits=2)
+        strataname<-as.character(input$name)
+        AIMdata2<- AIMdata2 %>% filter(get(input$Select) %in% strataname)
+        AIMdata2
+    })
+    
+    ##creating summary function to be used throughout the code
+    data_summary <- function(data,
+                             variables,
+                             values,
+                             names = NULL) {
+        if (is.null(x = names)) {
+            names <- variables
+        }
+        data %>%
+            group_by_at(.vars = variables) %>%
+            summarise_at(
+                .vars = values,
+                .funs = list(
+                    Min. = min,
+                    `1st Qu.` = ~ quantile(x = ., probs = 0.25,na.rm=TRUE),
+                    Median = median,
+                    Mean = mean,
+                    `3rd Qu.` = ~ quantile(x = ., probs = 0.75,na.rm=TRUE),
+                    Max. = max,
+                    St.Dev.=sd,
+                    Num.NA=~sum(is.na(x=.))
+                )
+            ) %>%
+            rename_at(.vars = variables,
+                      .funs = ~ names)
+    }
+    
+    
+    #Surface Cover data
+    
+    surfacecoverdata2<-reactive({
+        data7<-req(AIMdata())
+        data7<- data7 %>%  mutate(AH_ShrubCover) %>% mutate(AH_NonNoxSubShrubCover) %>%
+            mutate(AH_NoxSubShrubCover) %>% mutate(shrub.subshrub = (AH_ShrubCover+AH_NonNoxSubShrubCover+AH_NoxSubShrubCover))
+        data7<-data7%>% mutate(AH_NoxSucculentCover) %>% mutate(AH_NonNoxSucculentCover) %>%
+            mutate(succulent=AH_NoxSucculentCover+AH_NonNoxSucculentCover)
+        data7<-data7%>% mutate(AH_NoxTreeCover) %>% mutate(AH_NonNoxTreeCover) %>%
+            mutate(tree=AH_NoxTreeCover+AH_NonNoxTreeCover)
+        data7<-data7%>% mutate(AH_NoxAnnForbCover) %>% mutate(AH_NoxPerenForbCover) %>%
+            mutate(noxiousforb=AH_NoxAnnForbCover+AH_NoxPerenForbCover)
+        data7<-data7%>% mutate(AH_NonNoxAnnForbCover) %>% mutate(AH_NonNoxPerenForbCover) %>%
+            mutate(nonnoxiousforb=AH_NonNoxAnnForbCover+AH_NonNoxPerenForbCover)
+        data7<- data7 %>%  select(BareSoilCover,AH_ForbCover,AH_GrassCover,FH_TotalLitterCover,FH_RockCover,shrub.subshrub,AH_SagebrushCover,succulent,tree,TotalFoliarCover,input$Select) 
+        data7
+    })
+    surfacecoverdata<-reactive({
+        data4<-req(surfacecoverdata2())
+        data4<- data4 %>% gather(covertype,covervalue,-input$Select) 
+        data4<- data4 %>% mutate(covertype) %>%
+            mutate(covertype = fct_relevel(covertype, 
+                                           "BareSoilCover","AH_ForbCover","AH_GrassCover","FH_TotalLitterCover",
+                                           "FH_RockCover","shrub.subshrub","AH_SagebrushCover","succulent","tree","TotalFoliarCover"))
+        data4
+    })
+    
+    output$surfacecoverplt<-renderPlot({
+        if(is.null(input$name)){return()}
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Surface Cover     n=",nameN2)
+        Covers<-c("Bare Soil", "Forb","Grass", "Litter", "Rock","Shrub","Sagebrush","Succulent","Tree","Foliar")
+        print(ggplot(surfacecoverdata(),aes(x=covertype,y=covervalue,col=covertype))+geom_point(alpha=0.4)+
+                  geom_boxplot()+ggtitle(paste0(namepop))+labs(x="Cover Type",y="Average Percent Cover",colour="Cover Type")+
+                  scale_x_discrete(labels= Covers)+scale_color_hue(labels = Covers)+theme(axis.text.x=element_text(colour="gray20",angle = 45, hjust=1)))
+    })  
+    
+    surfacesumm<-reactive({
+        surfacesumm<-data_summary(surfacecoverdata(),'covertype','covervalue','Cover_Type')
+        surfacesumm<-as.data.frame(surfacesumm)
+        surfacesumm<-surfacesumm%>% 
+            mutate_if(is.numeric, round, digits=2)
+        surfacesumm
+    })
+    
+    output$sumsurfacecover<-renderPrint({
+        if(is.null(surfacecoverdata2())){return()}
+        surfacesumm()})
+    
+    surfacecoverdata3<-reactive({
+        data16<-req(AIMdata())
+        baresoil<-as.numeric(input$baresoilbench)
+        data16<- data16 %>%  select(BareSoilCover,PlotID) %>% filter(BareSoilCover > baresoil)
+        data16<-data16 %>% arrange(desc(BareSoilCover))
+        data16
+    })
+    
+    output$pltswbs<-renderPrint({
+        req(input$baresoilbench)
+        if(is.null(surfacecoverdata3())){return()}
+        surfacecoverdata3()})
+    
+    surfacecoverdata4<-reactive({
+        data17<-req(AIMdata())
+        foliar<-as.numeric(input$foliar)
+        data17<- data17 %>%  select(TotalFoliarCover,PlotID) %>% filter(TotalFoliarCover < foliar)
+        data17<-data17 %>% arrange(TotalFoliarCover)
+        data17
+    })
+    
+    output$pltswof<-renderPrint({
+        req(input$foliar)
+        if(is.null(surfacecoverdata4())){return()}
+        surfacecoverdata4()})
+    
+    surfacecoverdata5<-reactive({
+        datasc<-req(AIMdata())
+        sagecover<-as.numeric(input$sagecover)
+        datasc<- datasc %>%  select(AH_SagebrushCover,PlotID) %>% filter(AH_SagebrushCover < sagecover)
+        datasc<-datasc %>% arrange(AH_SagebrushCover)
+        datasc
+    })
+    
+    output$pltswsc<-renderPrint({
+        req(input$sagecover)
+        if(is.null(surfacecoverdata5())){return()}
+        surfacecoverdata5()})
+    
+    surfacecoverdata6<-reactive({
+        datapf<-req(AIMdata())
+        perforb<-as.numeric(input$perforb)
+        datapf<- datapf %>%  select(AH_NonNoxPerenForbCover,PlotID) %>% filter(AH_NonNoxPerenForbCover < perforb)
+        datapf<-datapf %>% arrange(AH_NonNoxPerenForbCover)
+        datapf
+    })
+    
+    output$pltswpf<-renderPrint({
+        req(input$perforb)
+        if(is.null(surfacecoverdata6())){return()}
+        surfacecoverdata6()})
+    
+    
+    #Soil Stability tables
+    soilstabdata<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL) 
+        data2<-req(AIMdata())
+        data2<- data2 %>%  select(SoilStability_All,SoilStability_Protected,SoilStability_Unprotected)
+        data2<-data2 %>% gather(soilstabtype,value)
+        data2
+    })
+    
+    soilsumm<-reactive({
+        soilsumm<-data_summary(soilstabdata(),'soilstabtype','value','Soil_Stability_Type')
+        soilsumm<-as.data.frame(soilsumm)
+        soilsumm<-soilsumm%>% 
+            mutate_if(is.numeric, round, digits=2)
+        soilsumm
+    })
+    
+    output$sumallsoil<-renderPrint({
+        if(is.null(soilstabdata())){return()}
+        soilsumm()})
+    
+    soilstabdata2<-reactive({
+        if (is.null(soilstabdata2))
+            return(NULL)                
+        data17<-req(AIMdata())
+        soilstab<-as.numeric(input$soilstab)
+        data17<- data17 %>%  select(SoilStability_All,PlotID) %>% filter(SoilStability_All < soilstab) %>%
+            arrange(SoilStability_All)
+        data17
+    })
+    
+    output$pltswoss<-renderPrint({
+        req(input$soilstab)
+        if(is.null(soilstabdata2())){return()}
+        soilstabdata2()})
+    
+    
+    #Gapdata
+    gapdata2<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data6<-AIMdata()
+        data6<- data6 %>%  select(GapCover_25_50,GapCover_51_100,GapCover_101_200,GapCover_200_plus) 
+        data6<- data6 %>% mutate(GapCover_25_50) %>% mutate(GapCover_51_100) %>% 
+            mutate(GapCover_101_200) %>% mutate(GapCover_200_plus) %>% mutate(CanopyCover=100-(GapCover_25_50+GapCover_51_100+GapCover_101_200+GapCover_200_plus))
+        data6
+    })
+    
+    gapdata<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data3<-gapdata2()
+        data3<-data3 %>% gather(Gapsize,Percentofplot)
+        data3<- data3 %>% mutate(Gapsize) %>%
+            mutate(Gapsize = fct_relevel(Gapsize, 
+                                         "CanopyCover", "GapCover_25_50", "GapCover_51_100", 
+                                         "GapCover_101_200", "GapCover_200_plus"))
+        data3
+    })
+    
+    
+    output$gapbarchart<-renderPlot({
+        if(is.null(gapdata())){return()}
+        print(ggplot(gapdata(),aes(x="",y=Percentofplot,fill=Gapsize))+
+                  geom_bar(width=0.5,position="fill", stat = "identity")+ggtitle("Average Percent Gap Cover by Gap Size")+coord_flip()+
+                  scale_fill_manual(values=c("cadetblue3", "khaki1","sienna1","firebrick3","firebrick4"),labels=c("Canopy Cover (No Gap)","25-50 (cm)","51-100 (cm)", "101-200 (cm)", "200+ (cm)"))+
+                  theme(axis.title.y = element_blank())+labs(y="Percent of Plot")+scale_y_continuous(labels=scales::percent))
+    })
+    
+    gapsumm<-reactive({
+        gapsumm<-data_summary(gapdata(),
+                              c('Gapsize'),
+                              c('Percentofplot'),
+                              c('Gap_size'))
+        gapsumm<-as.data.frame(gapsumm)
+        gapsumm<-gapsumm%>% 
+            mutate_if(is.numeric, round, digits=2)
+        gapsumm
+    })
+    
+    
+    output$sumgap<-renderPrint({
+        if(is.null(gapdata2())){return()}
+        gapsumm()})
+    
+    gapdata3<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data18<-AIMdata()
+        data18<- data18 %>%  select(GapCover_25_50,GapCover_51_100,GapCover_101_200,GapCover_200_plus, PlotID) 
+        data18<- data18 %>% mutate(GapCover_25_50) %>% mutate(GapCover_51_100) %>% 
+            mutate(GapCover_101_200) %>% mutate(GapCover_200_plus) %>% mutate(CanopyCover=100-(GapCover_25_50+GapCover_51_100+GapCover_101_200+GapCover_200_plus))%>%
+            mutate(Percent_Gap_Cover=GapCover_25_50+GapCover_51_100+GapCover_101_200+GapCover_200_plus)
+        gaps<-as.numeric(input$gapcover)
+        data18<- data18 %>%  select(Percent_Gap_Cover,PlotID) %>% filter(Percent_Gap_Cover > gaps)
+        data18<-data18 %>% arrange(desc(Percent_Gap_Cover))
+        data18
+    })
+    
+    output$pltswgap<-renderPrint({
+        req(input$gapcover)
+        if(is.null(gapdata3())){return()}
+        gapdata3()})
+    
+    
+    #heights summary
+    
+    heightsdata<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data11<-AIMdata()
+        data11<-data11 %>% select(Hgt_Forb_Avg,Hgt_Grass_Avg,Hgt_NonSagebrushShrub_Avg,Hgt_Sagebrush_Avg)
+        data11<-data11 %>% gather(speciestype,heightvalue)
+        data11
+    })
+    
+    hgtsumm<-reactive({
+        hgtsumm<-data_summary(heightsdata(),
+                              c('speciestype'),
+                              c('heightvalue'),
+                              c('Height_Type'))
+        hgtsumm<-as.data.frame(hgtsumm)
+        hgtsumm<-hgtsumm%>% 
+            mutate_if(is.numeric, round, digits=2)
+        hgtsumm
+    })
+    
+    output$sumheights<-renderPrint({
+        if(is.null(heightsdata())){return()}
+        hgtsumm()})
+    
+    
+    #noxious data
+    
+    noxdata<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data12<-AIMdata()
+        data12<-data12 %>% select(AH_NoxCover,AH_NonNoxCover)
+        data12<- data12 %>% gather(noxcovertype,noxcovervalue)
+        data12<- data12 %>% mutate(noxcovertype) %>%
+            mutate(noxcovertype = fct_relevel(noxcovertype, 
+                                              "AH_NonNoxCover", "AH_NoxCover"))
+        data12
+    })
+    
+    output$Noxgraph<-renderPlot({
+        if(is.null(noxdata())){return()}
+        Covers<-c("Nonnox.", "Noxious")
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Percent Cover of Noxious and Nonnoxious Species     n=",nameN2)
+        print(ggplot(noxdata(),aes(x=noxcovertype,y=noxcovervalue, col=noxcovertype))+geom_point(alpha=0.4)+geom_boxplot()+
+                  ggtitle(paste0(namepop))+labs(x="Cover Type",y="Average Percent Cover",colour="Cover Type")+
+                  scale_x_discrete(labels= Covers)+scale_color_manual(values=c("seagreen2","darkred"),labels = c("Nonnoxious", "Noxious"))+
+                  theme(axis.text.x=element_text(colour="gray20",angle = 45, hjust=1)))
+        
+        
+    })
+    
+    noxdata2<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data13<-AIMdata()
+        data13<-data13 %>% select(AH_NoxCover,AH_NonNoxCover,PlotID)
+        noxcover<-as.numeric(input$noxcover)
+        data13<-data13 %>% filter(AH_NoxCover > noxcover) %>% arrange(desc(AH_NoxCover))
+        data13
+    })
+    
+    output$pltswnox<-renderPrint({
+        req(input$noxcover)
+        if(is.null(noxdata())){return()}
+        noxdata2()
+        
+        
+    })
+    
+    #perennial/annual grass data
+    
+    grassdata<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data14<-AIMdata()
+        data14<-data14 %>% select(AH_PerenGrassCover,AH_AnnGrassCover)
+        data14<- data14 %>% gather(grasscovertype,grasscovervalue)
+        data14<- data14 %>% mutate(grasscovertype) %>%
+            mutate(grasscovertype = fct_relevel(grasscovertype, 
+                                                "AH_AnnGrassCover", "AH_PerenGrassCover"))
+        data14
+    })
+    
+    output$APGrassgraph<-renderPlot({
+        if(is.null(grassdata())){return()}
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Percent Cover of Annual and Perennial Grass     n=",nameN2)
+        Covers<-c("Annual Grass","Perennial Grass")
+        print(ggplot(grassdata(), aes(x=grasscovertype,y=grasscovervalue,col=grasscovertype))+geom_boxplot()+
+                  ggtitle(paste0(namepop))+labs(x="Duration",y="Average Percent Cover",colour="Duration")+scale_x_discrete(labels= Covers)+
+                  theme(axis.text.x=element_text(colour="gray20",angle = 45, hjust=1))+ scale_color_manual(values=c("rosybrown3","paleturquoise3"),labels = c("Annual", "Perennial")))
+        
+    })
+    
+    
+    grassdata2<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data15<-AIMdata()
+        data15<-data15 %>% select(AH_PerenGrassCover,AH_AnnGrassCover,PlotID)
+        perengrass<-input$perengrass
+        data15<-data15 %>% filter(AH_PerenGrassCover < perengrass) %>% arrange(AH_PerenGrassCover)
+        data15
+    })
+    
+    output$pltswann<-renderPrint({
+        req(input$perengrass)
+        if(is.null(grassdata2())){return()}
+        grassdata2()
+    })
+    
+    
+    #dominant species data
+    PSPSdata<-reactive({
+        if (is.null(input$file1))
+            return(NULL)                
+        PSPSdatadb<-read.csv("./Data/Species_Indicator_data_CO.csv", header = TRUE, stringsAsFactors = FALSE)
+        data19<-AIMdata()
+        data9<-subset(PSPSdatadb, PrimaryKey %in% data19$PrimaryKey)
+        data9
+    })
+    domssdata<-reactive({
+        if (is.null(PSPSdata()))
+            return(NULL)                
+        data5<-PSPSdata()
+        data5[is.na(data5)] = 0
+        data5<-data5 %>%
+            group_by(Species) %>% mutate(AH_SpeciesCover) %>%
+            mutate(N_category=n()) %>% mutate(AH_SpeciesCover) %>%
+            ungroup() %>% mutate(N_category) %>%
+            mutate(dom_ss=N_category/length(unique(PrimaryKey))) %>%
+            filter(dom_ss >= .2) %>%
+            group_by(Species) %>% mutate(AH_SpeciesCover) %>%
+            mutate(SS_avg=sum(AH_SpeciesCover)/length(unique(PrimaryKey))) %>%
+            arrange(desc(dom_ss))
+        datadom<-data5[!duplicated(data5$Species),]
+        datadom2<-head(datadom,6)
+        datadom2list<-datadom2$Species
+        data5<- data5 %>% filter(Species %in% datadom2list)
+        data5
+    })
+    
+    
+    output$domss<-renderPlot({
+        if(is.null(domssdata())){return()}
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Percent Cover of Dominant Species     n=",nameN2)
+        print(ggplot(domssdata(), aes(x=Species, y = AH_SpeciesCover))+geom_boxplot()+
+                  ggtitle(paste0(namepop))+labs(x="Plant Species Code",y="Average Percent Cover")+
+                  facet_grid(.~GrowthHabit, scale = "free", drop= TRUE)+theme(axis.text.x=element_text(colour="gray20")))
+    })
+    
+    domssdata2<-reactive({
+        if (is.null(AIMdata()))
+            return(NULL)                
+        data8<-domssdata()
+        data8<-data8 %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Mean=mean(AH_SpeciesCover,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Median=median(AH_SpeciesCover,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Max=max(AH_SpeciesCover,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Min=min(AH_SpeciesCover,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(St.Dev.=sd(AH_SpeciesCover,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Q1=quantile(AH_SpeciesCover,.25,na.rm=TRUE)) %>%
+            mutate(AH_SpeciesCover) %>%  mutate(Q3=quantile(AH_SpeciesCover,.75,na.rm=TRUE))
+        data8<-data8[!duplicated(data8$Species),]
+        data8<- data8 %>% select(Species,Min,Q1,Median,Mean,Max,Q3,St.Dev.)
+        data8<-as.data.frame(data8)
+        data8
+    })
+    
+    output$sumdomss<-renderPrint({
+        if(is.null(domssdata2())){return()}
+        domssdata2()
+    })
+    
+    #SI table
+    
+    output$PSPSdatatbl<-renderTable({
+        if(is.null(PSPSdata())){return()}
+        PSPSdata()
+    })
+    
+    #AIMdata export xlsx
+    helpdata<-reactive({
+        Sheet_Number<-c("Sheet2","Sheet3","Sheet4","Sheet5","Sheet6","Sheet7","Sheet8")
+        Sheet_Description<-c("AIMdata","Species_Indicator_Data","Surface_Cover_Summary","Soil_Stability_Summary","Gap_Summary","Heights_Summary","Dominant_Species_Summary")
+        helpdata<-data.frame(Sheet_Number,Sheet_Description)
+        helpdata
+    })
+    
+    
+    workbook<-reactive({
+        workbook<-list(helpdata(),AIMdata(),PSPSdata(),surfacesumm(), soilsumm(), gapsumm(), hgtsumm(), domssdata2())
+        workbook
+    })
+    
+    output$download <- downloadHandler(
+        filename = function() { "AIMdata.xlsx"},
+        content = function(file) {write_xlsx(workbook(), path = file)}
+    )
+    
+    #pdf of plots
+    namepop1<-reactive({
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Surface Cover     n=",nameN2)
+    })
+    
+    namepop2<-reactive({
+        nameN<-count(AIMdata(),PrimaryKey)
+        nameN2<-sum(nameN$n)
+        namepop<-paste("Dominant Species     n=",nameN2)
+    })
+    
+    
+    plotinput <- function() {
+        list(p1 = ggplot(surfacecoverdata(),aes(x=covertype,y=covervalue,col=covertype))+geom_point(alpha=0.4)+
+                 geom_boxplot()+ggtitle(paste0(namepop1()))+labs(x="Cover Type",y="Average Percent Cover",colour="Cover Type")+
+                 scale_x_discrete(labels= c("Bare Soil", "Forb","Grass", "Litter", "Rock","Shrub","Sagebrush","Succulent","Tree","Foliar"))+theme(axis.text.x=element_text(colour="gray20",angle = 45, hjust=1)),
+             p2 =  ggplot(gapdata(),aes(x="",y=Percentofplot,fill=Gapsize))+
+                 geom_bar(width=0.5,position="fill", stat = "identity")+ggtitle("Average Percent Gap Cover by Gap Size")+coord_flip()+
+                 scale_fill_manual(values=c("cadetblue3", "khaki1","sienna1","firebrick3","firebrick4"),labels=c("Canopy Cover (No Gap)","25-50 (cm)","51-100 (cm)", "101-200 (cm)", "200+ (cm)"))+
+                 theme(axis.title.y = element_blank())+labs(y="Percent of Plot")+scale_y_continuous(labels=scales::percent),
+             p3 =ggplot(domssdata(), aes(x=Species, y = AH_SpeciesCover))+geom_boxplot()+
+                 ggtitle(paste0(namepop2()))+labs(x="Plant Species Code",y="Average Percent Cover",colour="Growth Form")+
+                 facet_grid(.~GrowthHabit, scale = "free", drop= TRUE)+theme(axis.text.x=element_text(colour="gray20")) )
+    }
+    
+    output$allgraphs = downloadHandler(
+        filename = 'graphs.pdf',
+        content = function(file) {
+            pdf(file)
+            
+            arrangeGrob(print(plotinput()[['p1']]),
+                        print(plotinput()[['p2']]), 
+                        print(plotinput()[['p3']]), ncol = 3)  
+            dev.off()
+        })
+    
+    
+    #########exporting shapefile of not meeting
+    
+    benchxlbs<-reactive({
+        benchxlbs<-req(AIMdata())
+        baresoil<-as.numeric(input$baresoilbench)
+        benchxlbs<- benchxlbs %>%  select(BareSoilCover,PlotID,Latitude2,Longitude2) %>% filter(BareSoilCover > baresoil)
+        benchxlbs<-benchxlbs %>% arrange(desc(BareSoilCover))
+        benchxlbs<-benchxlbs %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchxlbs
+    })
+    
+    benchxlf<-reactive({
+        benchxlf<-req(AIMdata())
+        foliar<-as.numeric(input$foliar)
+        benchxlf<- benchxlf %>%  select(TotalFoliarCover,PlotID,Latitude2,Longitude2) %>% filter(TotalFoliarCover < foliar)
+        benchxlf<-benchxlf %>% arrange(TotalFoliarCover)
+        benchxlf<-benchxlf %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchxlf
+    })
+    
+    benchxlsage<-reactive({
+        benchxlsage<-req(AIMdata())
+        sagecover<-as.numeric(input$sagecover)
+        benchxlsage<- benchxlsage %>%  select(AH_SagebrushCover,PlotID,Latitude2,Longitude2) %>% filter(AH_SagebrushCover < sagecover)
+        benchxlsage<-benchxlsage %>% arrange(AH_SagebrushCover)
+        benchxlsage<-benchxlsage %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchxlsage
+    })
+    
+    benchforb<-reactive({
+        benchforb<-req(AIMdata())
+        perforb<-as.numeric(input$perforb)
+        benchforb<- benchforb %>%  select(AH_NonNoxPerenForbCover,PlotID,Latitude2,Longitude2) %>% filter(AH_NonNoxPerenForbCover < perforb)
+        benchforb<-benchforb %>% arrange(AH_NonNoxPerenForbCover)
+        benchforb<-benchforb %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchforb
+    })
+    
+    
+    benchsoil<-reactive({
+        benchsoil<-req(AIMdata())
+        soilstab<-as.numeric(input$soilstab)
+        benchsoil<- benchsoil %>%  select(SoilStability_All,PlotID,Latitude2,Longitude2) %>% filter(SoilStability_All < soilstab)
+        benchsoil<-benchsoil %>% arrange(SoilStability_All)
+        benchsoil<-benchsoil %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchsoil
+    })
+    
+    benchgap<-reactive({
+        benchgap<-req(AIMdata())
+        gapcover<-as.numeric(input$gapcover)
+        benchgap<- benchgap %>%  select(GapCover_25_50,GapCover_51_100,GapCover_101_200,GapCover_200_plus,PlotID,Latitude2,Longitude2) 
+        benchgap<- benchgap%>% mutate(GapCover_25_50) %>% mutate(GapCover_51_100) %>% 
+            mutate(GapCover_101_200) %>% mutate(GapCover_200_plus) %>%
+            mutate(Percent_Gap_Cover=GapCover_25_50+GapCover_51_100+GapCover_101_200+GapCover_200_plus)
+        benchgap<- benchgap %>%  select(Percent_Gap_Cover,PlotID,Latitude2,Longitude2) %>% filter(Percent_Gap_Cover > gapcover)
+        benchgap<-benchgap %>% arrange(desc(Percent_Gap_Cover))
+        benchgap<-benchgap %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchgap
+    })
+    
+    benchnox<-reactive({
+        benchnox<-req(AIMdata())
+        noxcover<-as.numeric(input$noxcover)
+        benchnox<- benchnox %>%  select(AH_NoxCover,PlotID,Latitude2,Longitude2) %>% filter(AH_NoxCover > noxcover)
+        benchnox<-benchnox %>% arrange(desc(AH_NoxCover))
+        benchnox<-benchnox %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchnox
+    })
+    
+    benchperen<-reactive({
+        benchperen<-req(AIMdata())
+        peren<-as.numeric(input$perengrass)
+        benchperen<- benchperen %>%  select(AH_PerenGrassCover,PlotID,Latitude2,Longitude2) %>% filter(AH_PerenGrassCover < peren)
+        benchperen<-benchperen %>% arrange(AH_PerenGrassCover)
+        benchperen<-benchperen %>% gather(Indicator,value,-PlotID,-Latitude2,-Longitude2)
+        benchperen
+    })
+    
+    benchxl<-reactive({
+        bs<-benchxlbs()
+        f<-benchxlf()
+        sage<-benchxlsage()
+        forb<-benchforb()
+        soil<-benchsoil()
+        gap<-benchgap()
+        nox<-benchnox()
+        peren<-benchperen()
+        benchxl<-do.call("rbind",list(bs,f,sage,forb,soil,gap,nox,peren))
+        benchxl
+    })
+    
+    
+    
+    workbook2<-reactive({
+        workbook<-list(benchxl())
+        workbook
+    })
+    
+    output$benchxl <- downloadHandler(
+        filename = function() { "not_meeting_bench.xlsx"},
+        content = function(file) {write_xlsx(workbook2(), path = file)}
+    )
+    
+    
+    
+    
+    
+    
+}
+
+
+
+# Run the application 
+shinyApp(ui = ui, server = server)
